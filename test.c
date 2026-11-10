@@ -99,11 +99,46 @@ static void test_torn_tail_is_cut_off(void) {
   if (db) kv_close(db);
 }
 
+static void flip_byte(long at) {
+  FILE *f = fopen(path, "r+b");
+  fseek(f, at, SEEK_SET);
+  int c = fgetc(f);
+  fseek(f, at, SEEK_SET);
+  fputc(c ^ 0x10, f);
+  fclose(f);
+}
+
+static void test_bit_rot_is_refused_and_scrub_finds_it(void) {
+  unlink(path);
+  int err;
+  kv *db = kv_open(path, NULL, &err);
+  fill(db, 100);
+  kv_close(db);
+  long full = file_size(), rec = full / 100;
+  kv_stats st;
+  CHECK(kv_scrub(path, &st) == KV_OK && st.records == 100 && st.bad == 0 && st.bytes == (uint64_t)full);
+  flip_byte(50 * rec + rec - 3);
+  err = 0;
+  CHECK(kv_open(path, NULL, &err) == NULL && err == KV_ECORRUPT);
+  CHECK(file_size() == full);
+  CHECK(kv_scrub(path, &st) == KV_ECORRUPT);
+  CHECK(st.records == 99 && st.bad == 1 && st.first_bad == (uint64_t)(50 * rec));
+}
+
+static void test_crc32c_check_value(void) {
+  CHECK(kv_crc32c(0, "123456789", 9) == 0xE3069283u);
+  char big[1000];
+  for (int i = 0; i < 1000; i++) big[i] = (char)(i * 31);
+  CHECK(kv_crc32c(kv_crc32c(0, big, 333), big + 333, 667) == kv_crc32c(0, big, 1000));
+}
+
 int main(void) {
   if (!mkdtemp(dir)) return 2;
   snprintf(path, sizeof path, "%s/db.log", dir);
   test_put_get_del_survive_reopen();
   test_torn_tail_is_cut_off();
+  test_bit_rot_is_refused_and_scrub_finds_it();
+  test_crc32c_check_value();
   printf(fails ? "FAIL %d\n" : "ok\n", fails);
   return fails != 0;
 }

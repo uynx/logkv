@@ -285,4 +285,31 @@ int kv_close(kv *db) {
 }
 
 int kv_compact(kv *db) { (void)db; return KV_EIO; }
-int kv_scrub(const char *path, kv_stats *st) { (void)path; (void)st; return KV_EIO; }
+int kv_scrub(const char *path, kv_stats *st) {
+  memset(st, 0, sizeof *st);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return KV_EIO;
+  struct stat sb;
+  if (fstat(fd, &sb)) { close(fd); return KV_EIO; }
+  uint64_t size = (uint64_t)sb.st_size, off = 0;
+  uint8_t *m = size ? mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+  close(fd);
+  if (m == MAP_FAILED) return KV_EIO;
+  if (size) madvise(m, size, MADV_SEQUENTIAL);
+  while (off < size) {
+    uint64_t good = walk(m + off, size - off, NULL, NULL, &st->records);
+    st->bytes += good;
+    off += good;
+    if (off == size) break;
+    if (!st->bad++) st->first_bad = off;
+    uint32_t klen, vlen;
+    if (off + HDR > size) break;
+    memcpy(&klen, m + off + 4, 4);
+    memcpy(&vlen, m + off + 8, 4);
+    uint64_t n = reclen(klen, vlen);
+    if (!klen || n - HDR > MAXREC || off + n > size) break; /* header itself is damaged, nothing after it can be framed */
+    off += n;
+  }
+  if (size) munmap(m, size);
+  return st->bad ? KV_ECORRUPT : KV_OK;
+}
