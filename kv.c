@@ -221,6 +221,19 @@ static uint64_t walk(const uint8_t *m, uint64_t size, int (*fn)(void *, const ui
   return off;
 }
 
+/* A crash leaves a short last record or zeroed blocks; a bad record with more data after it is corruption. */
+static int is_torn(const uint8_t *m, uint64_t off, uint64_t size) {
+  if (off + HDR > size) return 1;
+  uint32_t klen, vlen;
+  memcpy(&klen, m + off + 4, 4);
+  memcpy(&vlen, m + off + 8, 4);
+  uint64_t n = reclen(klen, vlen);
+  if (off + n >= size) return 1;
+  for (uint64_t i = off; i < size; i++)
+    if (m[i]) return 0;
+  return 1;
+}
+
 static int load_rec(void *arg, const uint8_t *r, uint64_t off) {
   uint32_t klen, vlen;
   memcpy(&klen, r + 4, 4);
@@ -247,9 +260,12 @@ kv *kv_open(const char *path, kv_stats *st, int *err) {
     if (m == MAP_FAILED) goto fail;
     madvise(m, size, MADV_SEQUENTIAL);
     uint64_t good = walk(m, size, load_rec, db, &st->records);
+    int torn = good < size && is_torn(m, good, size);
     munmap(m, size);
-    if (good != size) { e = KV_ECORRUPT; goto fail; }
-    st->bytes = good;
+    if (good != size && !torn) { e = KV_ECORRUPT; goto fail; }
+    if (torn && (ftruncate(db->fd, (off_t)good) || fsync(db->fd))) goto fail;
+    st->bytes = db->flushed = db->end = good;
+    st->truncated = size - good;
   }
   return db;
 fail:
