@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <libgen.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -26,6 +27,7 @@ struct kv {
   uint32_t blen;
 };
 
+static char *tmp_path(const char *path);
 static uint32_t crc_table[8][256];
 
 static void crc_init(void) {
@@ -249,6 +251,9 @@ kv *kv_open(const char *path, kv_stats *st, int *err) {
   int e = KV_ENOMEM;
   if (!db || !(db->buf = malloc(BUFCAP)) || !(db->path = strdup(path))) goto fail;
   e = KV_EIO;
+  char *stale = tmp_path(path);
+  if (stale) unlink(stale);
+  free(stale);
   if ((db->fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644)) < 0) goto fail;
   struct stat sb;
   if (fstat(db->fd, &sb)) goto fail;
@@ -284,7 +289,74 @@ int kv_close(kv *db) {
   return r;
 }
 
-int kv_compact(kv *db) { (void)db; return KV_EIO; }
+static char *tmp_path(const char *path) {
+  size_t n = strlen(path) + sizeof ".compact";
+  char *t = malloc(n);
+  if (t) snprintf(t, n, "%s.compact", path);
+  return t;
+}
+
+static int sync_dir(const char *path) {
+  char *d = strdup(path);
+  if (!d) return KV_ENOMEM;
+  int fd = open(dirname(d), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  free(d);
+  if (fd < 0) return KV_EIO;
+  int r = fsync(fd);
+  close(fd);
+  return r ? KV_EIO : 0;
+}
+
+/* Rewrites live records into a new file and renames it over the log; a crash before the rename leaves the old log intact. */
+int kv_compact(kv *db) {
+  if (kv_sync(db)) return KV_EIO;
+  char *tmp = tmp_path(db->path);
+  slot *nt = calloc(db->cap, sizeof *nt);
+  int fd = tmp ? open(tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
+  int r = KV_EIO;
+  if (!nt || fd < 0) goto out;
+  uint64_t off = 0, flushed = 0;
+  uint32_t blen = 0;
+  for (uint64_t i = 0; i < db->cap; i++) {
+    slot s = db->tab[i];
+    if (!s.hash || s.vlen == TOMB) continue;
+    uint64_t n = reclen(s.klen, s.vlen);
+    if (blen + n > BUFCAP) {
+      if (write_all(fd, db->buf, blen, flushed)) goto out;
+      flushed += blen;
+      blen = 0;
+    }
+    uint8_t *rec = n <= BUFCAP ? db->buf + blen : malloc(n);
+    if (!rec || read_at(db, s.off, rec, n)) { if (n > BUFCAP) free(rec); goto out; }
+    if (n > BUFCAP) {
+      int w = write_all(fd, rec, n, flushed);
+      free(rec);
+      if (w) goto out;
+      flushed += n;
+    } else {
+      blen += (uint32_t)n;
+    }
+    uint64_t j = s.hash & (db->cap - 1);
+    while (nt[j].hash) j = (j + 1) & (db->cap - 1);
+    nt[j] = (slot){s.hash, off, s.klen, s.vlen};
+    off += n;
+  }
+  if (write_all(fd, db->buf, blen, flushed) || fdatasync(fd) || rename(tmp, db->path) || sync_dir(db->path)) goto out;
+  close(db->fd);
+  db->fd = fd;
+  fd = -1;
+  free(db->tab);
+  db->tab = nt;
+  nt = NULL;
+  db->used = db->live;
+  db->end = db->flushed = off;
+  r = 0;
+out:
+  if (fd >= 0) { close(fd); unlink(tmp); }
+  free(nt);
+  free(tmp);
+  return r;
+}
 int kv_scrub(const char *path, kv_stats *st) {
   memset(st, 0, sizeof *st);
   int fd = open(path, O_RDONLY | O_CLOEXEC);

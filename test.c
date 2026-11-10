@@ -177,6 +177,43 @@ static void test_kill_mid_write_keeps_every_synced_key(void) {
   }
 }
 
+static void test_compact_keeps_live_keys_and_shrinks_the_log(void) {
+  unlink(path);
+  int err;
+  kv *db = kv_open(path, NULL, &err);
+  for (int r = 0; r < 5; r++) fill(db, 1000);
+  char k[32], v[256];
+  for (int i = 0; i < 100; i++) { int kl = snprintf(k, sizeof k, "key%06d", i); kv_del(db, k, kl); }
+  CHECK(kv_sync(db) == KV_OK);
+  uint64_t before = kv_size(db);
+  CHECK(kv_compact(db) == KV_OK);
+  uint64_t rec = before / 5100 + 1;
+  CHECK(kv_size(db) < 901 * rec && kv_size(db) == (uint64_t)file_size());
+  CHECK(kv_count(db) == 900);
+  CHECK(get_str(db, "key000050", v) == KV_MISSING);
+  kv_put(db, "after", 5, "compact", 7);
+  kv_close(db);
+  char tmp[300];
+  snprintf(tmp, sizeof tmp, "%s.compact", path);
+  FILE *f = fopen(tmp, "wb");
+  fputs("half-written compaction output", f);
+  fclose(f);
+  kv_stats st;
+  db = kv_open(path, &st, &err);
+  CHECK(db && kv_count(db) == 901 && st.truncated == 0);
+  CHECK(access(tmp, F_OK) != 0);
+  CHECK(get_str(db, "after", v) == KV_OK && !strcmp(v, "compact"));
+  int ok = 1;
+  for (int i = 100; i < 1000; i++) {
+    char want[64];
+    snprintf(k, sizeof k, "key%06d", i);
+    snprintf(want, sizeof want, "value-%06d-%06d", i, i * 7);
+    ok &= get_str(db, k, v) == KV_OK && !strcmp(v, want);
+  }
+  CHECK(ok);
+  kv_close(db);
+}
+
 int main(void) {
   if (!mkdtemp(dir)) return 2;
   snprintf(path, sizeof path, "%s/db.log", dir);
@@ -185,6 +222,7 @@ int main(void) {
   test_bit_rot_is_refused_and_scrub_finds_it();
   test_crc32c_check_value();
   test_kill_mid_write_keeps_every_synced_key();
+  test_compact_keeps_live_keys_and_shrinks_the_log();
   printf(fails ? "FAIL %d\n" : "ok\n", fails);
   return fails != 0;
 }
