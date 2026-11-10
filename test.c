@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -132,6 +135,48 @@ static void test_crc32c_check_value(void) {
   CHECK(kv_crc32c(kv_crc32c(0, big, 333), big + 333, 667) == kv_crc32c(0, big, 1000));
 }
 
+/* The writer reports each count only after kv_sync returns, so every reported key must survive the kill. */
+static void test_kill_mid_write_keeps_every_synced_key(void) {
+  srand((unsigned)time(NULL));
+  for (int round = 0; round < 20; round++) {
+    unlink(path);
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(fds[0]);
+      int err;
+      kv *db = kv_open(path, NULL, &err);
+      char k[32], v[64];
+      for (int i = 0;; i++) {
+        int kl = snprintf(k, sizeof k, "key%06d", i), vl = snprintf(v, sizeof v, "value-%06d-%06d", i, i * 7);
+        kv_put(db, k, kl, v, vl);
+        if (i % 50 == 49) {
+          kv_sync(db);
+          int n = i + 1;
+          if (write(fds[1], &n, sizeof n) != sizeof n) _exit(1);
+        }
+      }
+    }
+    close(fds[1]);
+    int acked = 0, n, want = 1 + rand() % 40;
+    for (int got = 0; got < want && read(fds[0], &n, sizeof n) == sizeof n; got++) acked = n;
+    usleep((useconds_t)(rand() % 3000));
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    while (read(fds[0], &n, sizeof n) == sizeof n) acked = n;
+    close(fds[0]);
+    int err;
+    kv_stats st;
+    kv *db = kv_open(path, &st, &err);
+    CHECK(db);
+    if (!db) return;
+    CHECK(acked > 0 && kv_count(db) >= (uint64_t)acked);
+    CHECK(check_prefix(db, (int)kv_count(db)));
+    kv_close(db);
+  }
+}
+
 int main(void) {
   if (!mkdtemp(dir)) return 2;
   snprintf(path, sizeof path, "%s/db.log", dir);
@@ -139,6 +184,7 @@ int main(void) {
   test_torn_tail_is_cut_off();
   test_bit_rot_is_refused_and_scrub_finds_it();
   test_crc32c_check_value();
+  test_kill_mid_write_keeps_every_synced_key();
   printf(fails ? "FAIL %d\n" : "ok\n", fails);
   return fails != 0;
 }
