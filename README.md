@@ -15,7 +15,7 @@ logkv is a small key-value store in C17 that keeps every write in one append-onl
 
 ## Numbers
 
-Measured with `make bench` on an 8-thread laptop with an NVMe drive on November 12, 2026, with the load average between 9 and 12 from other jobs. One million records, each a 16-byte key and a 100-byte value.
+Measured with `make bench` on an 8-thread laptop with an NVMe drive on November 12, 2026, with the load average between 9 and 12 from other jobs. Each record has a 16-byte key and a 100-byte value. The write runs insert 2,000 records for sync-every-1, 200,000 for sync-every-100, and 1,000,000 for sync-every-10,000, and the open, get, scrub and compact numbers all run on that 1,000,000-record log.
 
 | Operation | Result |
 | --- | --- |
